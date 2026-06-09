@@ -96,8 +96,8 @@ mod tests {
         assert!(
             bot.client()
                 .custom_enc_handlers
-                .read()
-                .await
+                .get()
+                .unwrap()
                 .contains_key("frskmsg")
         );
     }
@@ -126,21 +126,11 @@ mod tests {
             .expect("Failed to build bot");
 
         // Verify both handlers were registered
-        assert!(
-            bot.client()
-                .custom_enc_handlers
-                .read()
-                .await
-                .contains_key("frskmsg")
-        );
-        assert!(
-            bot.client()
-                .custom_enc_handlers
-                .read()
-                .await
-                .contains_key("customtype")
-        );
-        assert_eq!(bot.client().custom_enc_handlers.read().await.len(), 2);
+        let client = bot.client();
+        let handlers = client.custom_enc_handlers.get().unwrap();
+        assert!(handlers.contains_key("frskmsg"));
+        assert!(handlers.contains_key("customtype"));
+        assert_eq!(handlers.len(), 2);
     }
 
     #[tokio::test]
@@ -161,7 +151,7 @@ mod tests {
             .await
             .expect("Failed to build bot");
 
-        // Verify no custom handlers are registered
-        assert_eq!(bot.client().custom_enc_handlers.read().await.len(), 0);
+        // Verify no custom handlers are registered (the map is set, just empty)
+        assert_eq!(bot.client().custom_enc_handlers.get().unwrap().len(), 0);
     }
 }
