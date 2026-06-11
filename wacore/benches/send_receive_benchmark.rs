@@ -32,38 +32,87 @@ fn main() {
     divan::main();
 }
 
+/// Deterministic bench RNG (SplitMix64). A local algorithm, so fixtures are
+/// stable across rand versions and platforms and baselines never shift on a
+/// dependency bump. The `CryptoRng` marker is satisfied for API purposes
+/// only: bench key material is synthetic by design.
+struct BenchRng(u64);
+
+impl BenchRng {
+    fn step(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+// rand 0.10: `Rng`/`CryptoRng` are blanket-implemented over the infallible
+// Try* traits, so these two impls are the whole surface.
+impl rand::TryRng for BenchRng {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok((self.step() >> 32) as u32)
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.step())
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for chunk in dst.chunks_mut(8) {
+            let bytes = self.step().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl rand::rand_core::TryCryptoRng for BenchRng {}
+
+/// Deterministically seeded RNG: fixtures must be identical across runs and
+/// builds so CodSpeed comparisons measure code, not key material.
+fn bench_rng(seed: u64) -> BenchRng {
+    BenchRng(seed)
+}
+
+/// FNV-1a fold of a fixture label into an RNG seed.
+fn seed_of(label: &str) -> u64 {
+    label.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // In-memory Signal stores
 // ---------------------------------------------------------------------------
 
-// Bench runtime: real thread-pool executor so `Runtime::spawn` actually
-// runs the spawned future in the background, mirroring how production
-// drives the parallel encrypt fan-out. `sleep` / `spawn_blocking` are not
-// exercised by the encrypt path.
-struct BenchRuntime {
-    pool: futures::executor::ThreadPool,
-}
-
-impl Default for BenchRuntime {
-    fn default() -> Self {
-        Self {
-            pool: futures::executor::ThreadPool::new().expect("create bench thread pool"),
-        }
-    }
-}
+// Bench runtime: runs spawned futures INLINE. CodSpeed's simulation
+// serializes threads, so a real pool would measure scheduler and
+// cross-thread synchronization overhead with zero parallelism benefit;
+// inline execution measures the encrypt work itself, deterministically.
+// `sleep` / `spawn_blocking` are not exercised by the encrypt path.
+#[derive(Default)]
+struct BenchRuntime;
 
 #[async_trait]
 impl Runtime for BenchRuntime {
     fn spawn(
         &self,
-        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
     ) -> AbortHandle {
-        use futures::task::SpawnExt;
-        // Silent spawn failure would skip a device's encrypt and fake the speedup.
-        self.pool
-            .spawn(future)
-            .expect("bench thread pool spawn failed");
-        AbortHandle::noop()
+        // Nested `futures::executor::block_on` panics, so drive the task with
+        // a noop-waker poll loop. Encrypt tasks are CPU-bound and complete
+        // without ever truly pending; the guard catches misuse.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        for _ in 0..1_000_000 {
+            if future.as_mut().poll(&mut cx).is_ready() {
+                return AbortHandle::noop();
+            }
+        }
+        panic!(
+            "BenchRuntime::spawn: task pended forever; inline runtime only suits CPU-bound tasks"
+        );
     }
 
     fn sleep(
@@ -234,9 +283,9 @@ struct User {
 
 impl User {
     fn new(user: &str, server: &str) -> Self {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(seed_of(user));
         let identity_key_pair = IdentityKeyPair::generate(&mut rng);
-        let reg_id = rand::random::<u32>() & 0x3FFF;
+        let reg_id = (seed_of(user) as u32) & 0x3FFF;
 
         let pk_id: PreKeyId = 1.into();
         let pk_pair = KeyPair::generate(&mut rng);
@@ -298,7 +347,7 @@ impl User {
 
 fn establish_session(sender: &mut User, receiver: &User) {
     let bundle = receiver.prekey_bundle();
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng(0xBE_5EED + 1);
     futures::executor::block_on(async {
         process_prekey_bundle(
             &receiver.address,
@@ -326,7 +375,7 @@ fn establish_bidirectional(a: &mut User, b: &mut User) {
         let ct_msg = CiphertextMessage::PreKeySignalMessage(
             PreKeySignalMessage::try_from(ct.serialize()).unwrap(),
         );
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 2);
         message_decrypt(
             &ct_msg,
             &a.address,
@@ -440,7 +489,7 @@ fn decrypt_dm(
         } else {
             CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext).unwrap())
         };
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 3);
         let decrypted = message_decrypt(
             &parsed,
             sender_addr,
@@ -570,7 +619,7 @@ fn setup_group_send(n: usize) -> GrpSendData {
 
     let sk_name = make_sender_key_name(&group_jid, &alice.address);
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 4);
         create_sender_key_distribution_message(&sk_name, &mut alice.sender_keys, &mut rng)
             .await
             .unwrap();
@@ -583,7 +632,7 @@ fn setup_group_send(n: usize) -> GrpSendData {
         force_skdm: false,
         resolver: MockResolver(devices),
         msg: text_msg(),
-        runtime: BenchRuntime::default(),
+        runtime: BenchRuntime,
     }
 }
 
@@ -631,7 +680,7 @@ fn setup_group_recv() -> GrpRecvData {
     // Alice creates sender key and distributes SKDM to Bob
     let sk_name = make_sender_key_name(&group_jid, &alice.address);
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 5);
         let skdm =
             create_sender_key_distribution_message(&sk_name, &mut alice.sender_keys, &mut rng)
                 .await
@@ -656,7 +705,7 @@ fn setup_group_recv() -> GrpRecvData {
         signed_prekey_store: &alice.signed_prekeys,
     };
 
-    let runtime = BenchRuntime::default();
+    let runtime = BenchRuntime;
     let result = futures::executor::block_on(prepare_group_stanza(
         &runtime,
         &mut stores,
@@ -692,12 +741,12 @@ fn setup_group_recv() -> GrpRecvData {
 
 #[divan::bench]
 fn bench_dm_send(bencher: divan::Bencher) {
-    bencher.with_inputs(setup_dm_send).bench_values(|mut d| {
+    bencher.with_inputs(setup_dm_send).bench_refs(|d| {
         let signal_addr = d.bob_jid.to_protocol_address();
         let node = futures::executor::block_on(prepare_peer_stanza(
             &mut d.alice.sessions,
             &mut d.alice.identity,
-            d.bob_jid,
+            d.bob_jid.clone(),
             &signal_addr,
             &d.msg,
             "b-001".into(),
@@ -710,7 +759,7 @@ fn bench_dm_send(bencher: divan::Bencher) {
 
 #[divan::bench]
 fn bench_dm_recv(bencher: divan::Bencher) {
-    bencher.with_inputs(setup_dm_recv).bench_values(|mut d| {
+    bencher.with_inputs(setup_dm_recv).bench_refs(|d| {
         black_box(decrypt_dm(
             &d.ciphertext,
             &d.enc_type,
@@ -772,21 +821,21 @@ fn run_group_send(d: &mut GrpSendData) {
 fn bench_group_send_10(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_send_10)
-        .bench_values(|mut d| run_group_send(&mut d));
+        .bench_refs(run_group_send);
 }
 
 #[divan::bench]
 fn bench_group_send_50(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_send_50)
-        .bench_values(|mut d| run_group_send(&mut d));
+        .bench_refs(run_group_send);
 }
 
 #[divan::bench]
 fn bench_group_send_256(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_send_256)
-        .bench_values(|mut d| run_group_send(&mut d));
+        .bench_refs(run_group_send);
 }
 
 // First-message group send: forces SKDM distribution with N pairwise encryptions
@@ -794,26 +843,26 @@ fn bench_group_send_256(bencher: divan::Bencher) {
 fn bench_group_send_skdm_10(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_skdm_10)
-        .bench_values(|mut d| run_group_send(&mut d));
+        .bench_refs(run_group_send);
 }
 
 #[divan::bench]
 fn bench_group_send_skdm_50(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_skdm_50)
-        .bench_values(|mut d| run_group_send(&mut d));
+        .bench_refs(run_group_send);
 }
 
 #[divan::bench]
 fn bench_group_send_skdm_256(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_skdm_256)
-        .bench_values(|mut d| run_group_send(&mut d));
+        .bench_refs(run_group_send);
 }
 
 #[divan::bench]
 fn bench_group_recv(bencher: divan::Bencher) {
-    bencher.with_inputs(setup_group_recv).bench_values(|mut d| {
+    bencher.with_inputs(setup_group_recv).bench_refs(|d| {
         black_box(decrypt_group(
             &d.skmsg_bytes,
             &d.alice_addr,
