@@ -33,8 +33,11 @@ jobs:
           filters: |
             voip:
               - 'wacore/src/voip/**'
-              # The wacore wasm build links the send layer the voip facade reuses.
+              # The wacore wasm build links the send layer the voip facade reuses, plus the call
+              # signaling/types that the voip code builds on.
               - 'wacore/src/send/**'
+              - 'wacore/src/stanza/call.rs'
+              - 'wacore/src/types/call.rs'
               - 'Cargo.toml'
               - 'wacore/Cargo.toml'
               - 'Cargo.lock'

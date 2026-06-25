@@ -40,6 +40,13 @@ jobs:
               # (encrypt_for_devices_with_sessions_raw, SessionPlan::assume_ready),
               # so a send-only change can break the --features voip build.
               - 'wacore/src/send/**'
+              # Call signaling/types carry #[cfg(feature = "voip")] code that only the
+              # --features voip build compiles, so a change to just these would otherwise
+              # skip the voip checks.
+              - 'src/handlers/call.rs'
+              - 'src/client/voip.rs'
+              - 'wacore/src/stanza/call.rs'
+              - 'wacore/src/types/call.rs'
               - 'examples/voip.rs'
               - 'examples/observability.rs'
               - 'examples/metrics.rs'
