@@ -420,9 +420,16 @@ async fn place_call(
     // shows only one here, a device-list resolution gap (e.g. the primary missing) is why a sibling
     // keeps ringing -- the dismiss is gated on `multi_device`.
     log::debug!(
-        "voip: call {call_id} resolved {} callee device(s) (sibling-dismiss {}): {ring_devices:?}",
+        "voip: call {call_id} resolved {} callee device(s) (sibling-dismiss {}): [{}]",
         ring_devices.len(),
         if multi_device { "armed" } else { "off" },
+        // Observed (PII-safe) device list, matching the rest of the call paths; the args only format
+        // when debug logging is enabled, so the join is free otherwise.
+        ring_devices
+            .iter()
+            .map(|j| j.observe().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
     );
     // The callKey we generate is what the engine and SFrame key from; the peer learns it by
     // decrypting the per-device <enc> we send below.
