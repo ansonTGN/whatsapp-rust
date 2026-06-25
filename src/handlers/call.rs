@@ -57,10 +57,12 @@ impl StanzaHandler for CallHandler {
                     call.from.observe()
                 );
                 let is_offer = matches!(call.action, CallAction::Offer { .. });
-                if is_offer && call.offline {
-                    // Offline-queue replay: the call is long dead (no relay, not connectable). Don't
-                    // ack or ring it -- surface a non-ringing missed-call so a consumer can't auto-
-                    // accept it (WA Web's cancel_call + missed_call for offerReceivedWhileOffline).
+                let is_offer_notice = matches!(call.action, CallAction::OfferNotice { .. });
+                if (is_offer || is_offer_notice) && call.offline {
+                    // Offline-queue replay (an offer or a group-call offer_notice): the call is long
+                    // dead (no relay, not connectable). Don't ack or ring it -- surface a non-ringing
+                    // missed-call so a consumer can't auto-accept it (WA Web drops the stale notice
+                    // rather than ringing; its cancel_call + missed_call for offerReceivedWhileOffline).
                     client
                         .core
                         .event_bus
@@ -249,7 +251,7 @@ fn same_device(a: &Jid, b: &Jid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{MockHttpClient, create_test_backend, node_to_owned_ref};
+    use crate::test_utils::node_to_owned_ref;
     use std::sync::Arc;
     use wacore::types::events::{ChannelEventHandler, Event};
     use wacore_binary::builder::NodeBuilder;
@@ -276,22 +278,7 @@ mod tests {
     }
 
     async fn make_client() -> Arc<Client> {
-        use crate::store::persistence_manager::PersistenceManager;
-        let backend = create_test_backend().await;
-        let pm = PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager should initialize");
-        let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let http_client = Arc::new(MockHttpClient);
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            http_client,
-            None,
-        )
-        .await;
-        client
+        crate::test_utils::create_test_client().await
     }
 
     #[tokio::test]

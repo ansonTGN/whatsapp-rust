@@ -22,6 +22,6 @@ pub mod session;
 pub mod transport;
 
 pub use audio::{AudioSink, AudioSource};
-pub use facade::{AcceptCall, CallCall, CallHandle};
+pub use facade::{AcceptCall, CallHandle, OutgoingCall};
 // CallHandle::events() yields these, so surface them next to CallHandle (they live in wacore).
 pub use wacore::voip::CallEvent;

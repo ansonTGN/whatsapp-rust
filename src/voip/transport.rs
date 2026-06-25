@@ -98,6 +98,20 @@ pub struct RelayMediaChannel {
     runtime: Arc<dyn Runtime>,
 }
 
+impl RelayMediaChannel {
+    /// Lock the read-pump slot, recovering the guard on a poisoned mutex rather than panicking.
+    #[inline]
+    fn lock_pump(&self) -> std::sync::MutexGuard<'_, Option<AbortHandle>> {
+        self.pump.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock the association slot, recovering the guard on a poisoned mutex rather than panicking.
+    #[inline]
+    fn lock_assoc(&self) -> std::sync::MutexGuard<'_, Option<Arc<Association>>> {
+        self.assoc.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl Drop for RelayMediaChannel {
     fn drop(&mut self) {
         // The pump's own `AbortHandle` Drop already aborts the read pump. On an aborted driver
@@ -105,7 +119,7 @@ impl Drop for RelayMediaChannel {
         // `Drop` can't await; spawn the close on the portable runtime and `detach` so the returned
         // handle dropping at end of scope doesn't abort the close. This runs on the call's runtime
         // (the task owning this transport is being torn down on it), so the spawn always lands.
-        let assoc = self.assoc.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let assoc = self.lock_assoc().take();
         if let Some(assoc) = assoc {
             self.runtime
                 .spawn(Box::pin(async move {
@@ -248,7 +262,7 @@ impl RelayTransport for RelayMediaChannel {
 
     async fn disconnect(&self) {
         // Stop the read pump (Drop would also abort it) before closing the channel.
-        if let Some(h) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(h) = self.lock_pump().take() {
             h.abort();
         }
         let _ = self.dc.close().await;
@@ -256,7 +270,7 @@ impl RelayTransport for RelayMediaChannel {
         // released; `dc.close()` above only reset the stream. Drop covers the aborted-driver path.
         // Take out of the lock first: a `std::sync` guard held across the await would make the
         // `disconnect` future `!Send`.
-        let assoc = self.assoc.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let assoc = self.lock_assoc().take();
         if let Some(assoc) = assoc {
             let _ = assoc.close().await;
         }
@@ -324,7 +338,7 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
         let pump = self
             .runtime
             .spawn(Box::pin(relay_read_pump(chan.dc.clone(), tx)));
-        *chan.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(pump);
+        *chan.lock_pump() = Some(pump);
         Ok((chan as Arc<dyn RelayTransport>, rx))
     }
 }
@@ -545,22 +559,17 @@ mod udp_relay_e2e {
     const SAMPLES: u32 = 960;
 
     fn config(relay_addr: SocketAddr) -> CallConfig {
-        CallConfig {
-            call_id: "CID".into(),
-            direction: CallDirection::Incoming,
-            self_lid: SELF_LID.into(),
-            peer_lid: PEER_LID.into(),
-            call_key: (0u8..32).collect(),
-            ssrc: SSRC,
-            samples_per_packet: SAMPLES,
-            relay_token: vec![0xAB; 16],
-            relay_ip: relay_addr.ip().to_string(),
-            relay_port: relay_addr.port(),
-            integrity_key: b"relay-key".to_vec(),
-            warp_mi_tag_len: 4,
-            enable_media: true,
-            enable_sframe: false,
-        }
+        CallConfig::for_test(
+            CallDirection::Incoming,
+            SELF_LID,
+            PEER_LID,
+            (0u8..32).collect(),
+            SSRC,
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            true,  // enable_media
+            false, // enable_sframe (the loopback peer ships plain Opus inside E2E-SRTP)
+        )
     }
 
     /// The relay server half of the DataChannel: the DTLS server handshake (mirroring the client's

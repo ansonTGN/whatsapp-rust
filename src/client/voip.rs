@@ -109,8 +109,8 @@ impl Voip<'_> {
     /// only attaches once the server hands back the relay for our call-id (live), so the returned
     /// handle is dormant until then. Requires the `voip` feature.
     #[cfg(feature = "voip")]
-    pub fn call<'b>(&'b self, peer: &'b Jid) -> crate::voip::CallCall<'b> {
-        crate::voip::facade::CallCall::new(self.client, peer)
+    pub fn call<'b>(&'b self, peer: &'b Jid) -> crate::voip::OutgoingCall<'b> {
+        crate::voip::facade::OutgoingCall::new(self.client, peer)
     }
 
     /// Terminate an active call.
@@ -148,7 +148,6 @@ mod tests {
     use wacore_binary::{Jid, Server};
 
     use crate::client::Client;
-    use crate::test_utils::{MockHttpClient, create_test_backend};
 
     struct CountingTransport {
         count: Arc<AtomicUsize>,
@@ -165,21 +164,7 @@ mod tests {
     }
 
     async fn make_client_with_count() -> (Arc<Client>, Arc<AtomicUsize>) {
-        use crate::store::persistence_manager::PersistenceManager;
-        let backend = create_test_backend().await;
-        let pm = PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager should initialize");
-        let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let http_client = Arc::new(MockHttpClient);
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            http_client,
-            None,
-        )
-        .await;
+        let client = crate::test_utils::create_test_client().await;
 
         let count = Arc::new(AtomicUsize::new(0));
         let socket_transport: Arc<dyn crate::transport::Transport> = Arc::new(CountingTransport {

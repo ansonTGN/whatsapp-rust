@@ -236,10 +236,15 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 is_group,
             }
         }
-        "preaccept" => CallAction::PreAccept {
-            call_id,
-            call_creator,
-        },
+        "preaccept" => {
+            attrs
+                .finish()
+                .map_err(|e| anyhow!("<preaccept> attrs: {e}"))?;
+            CallAction::PreAccept {
+                call_id,
+                call_creator,
+            }
+        }
         "transport" => {
             let p2p_cand_round = attrs
                 .optional_string("p2p-cand-round")
@@ -266,14 +271,20 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 call_creator,
             }
         }
-        "accept" => CallAction::Accept {
-            call_id,
-            call_creator,
-        },
-        "reject" => CallAction::Reject {
-            call_id,
-            call_creator,
-        },
+        "accept" => {
+            attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
+            CallAction::Accept {
+                call_id,
+                call_creator,
+            }
+        }
+        "reject" => {
+            attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
+            CallAction::Reject {
+                call_id,
+                call_creator,
+            }
+        }
         "terminate" => {
             // WA Web gates the call-log outcome on `reason` (missed vs accepted/rejected-elsewhere),
             // so surface it instead of dropping it.

@@ -88,7 +88,10 @@ impl TxIdSource for SequentialTxIds {
 
 /// Everything the engine needs to be self-contained for one call. The relay fields come from the
 /// parsed `<relay>` stanza; the crypto fields from the decrypted callKey and our/our-peer LIDs.
+/// Build it via [`for_incoming`](Self::for_incoming) / [`for_outgoing`](Self::for_outgoing), which
+/// validate the relay block; `#[non_exhaustive]` so adding a field stays non-breaking for consumers.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct CallConfig {
     pub call_id: String,
     pub direction: CallDirection,
@@ -166,6 +169,10 @@ pub enum SetupError {
     NoRelayToken(u32),
     #[error("relay has no <key> (STUN integrity key)")]
     NoIntegrityKey,
+    /// The relay advertised a WARP MI tag length the SRTP layer can't honor (the tag is sliced from a
+    /// 20-byte HMAC-SHA1 digest, so 1..=20 is the only valid range).
+    #[error("relay advertised an unsupported WARP MI tag length: {0}")]
+    BadWarpMiTagLen(usize),
 }
 
 impl CallConfig {
@@ -205,6 +212,16 @@ impl CallConfig {
             0,
         );
 
+        // Default to 4 when absent; reject an out-of-range relay value here (a distinct relay-protocol
+        // error) rather than letting it collapse into BadCallKey when the SRTP layer rejects it.
+        let warp_mi_tag_len = relay
+            .warp_mi_tag_len
+            .map(|n| n as usize)
+            .unwrap_or(super::warp::WARP_MI_TAG_LEN);
+        if !(1..=20).contains(&warp_mi_tag_len) {
+            return Err(SetupError::BadWarpMiTagLen(warp_mi_tag_len));
+        }
+
         Ok(CallConfig {
             call_id: call_id.to_string(),
             direction,
@@ -218,10 +235,7 @@ impl CallConfig {
             relay_ip,
             relay_port,
             integrity_key,
-            warp_mi_tag_len: relay
-                .warp_mi_tag_len
-                .map(|n| n as usize)
-                .unwrap_or(super::warp::WARP_MI_TAG_LEN),
+            warp_mi_tag_len,
             enable_media: true,
             enable_sframe: true,
         })
@@ -262,6 +276,41 @@ impl CallConfig {
             call_key,
             relay,
         )
+    }
+
+    /// Build a config with explicit fields for tests, bypassing the relay-block derivation. Hidden
+    /// from docs: `#[non_exhaustive]` blocks cross-crate struct-literal construction, so a
+    /// dependent-crate test (e.g. the loopback relay e2e) builds through this. The relay token /
+    /// integrity key / call-id are fixed test values.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_test(
+        direction: CallDirection,
+        self_lid: impl Into<String>,
+        peer_lid: impl Into<String>,
+        call_key: Vec<u8>,
+        ssrc: u32,
+        relay_ip: impl Into<String>,
+        relay_port: u16,
+        enable_media: bool,
+        enable_sframe: bool,
+    ) -> Self {
+        Self {
+            call_id: "CID".into(),
+            direction,
+            self_lid: self_lid.into(),
+            peer_lid: peer_lid.into(),
+            call_key,
+            ssrc,
+            samples_per_packet: 960,
+            relay_token: vec![0xAB; 16],
+            relay_ip: relay_ip.into(),
+            relay_port,
+            integrity_key: b"relay-key".to_vec(),
+            warp_mi_tag_len: super::warp::WARP_MI_TAG_LEN,
+            enable_media,
+            enable_sframe,
+        }
     }
 }
 

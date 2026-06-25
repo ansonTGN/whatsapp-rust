@@ -76,15 +76,13 @@ impl<'a> AcceptCall<'a> {
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let source = self.source.take().ok_or(CallError::MissingAudio)?;
         let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
-        let (engine, call_id) = self.build_engine().await?;
+        let (engine, call_id, addr) = self.build_engine().await?;
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state already ran with no registry entry to abort, so bail
         // rather than register + connect a relay that would outlive the connection.
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        // The relay endpoint comes from the offer's relay block; resolve the socket addr to dial.
-        let addr = self.relay_addr()?;
         let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
         let session = wacore::voip::CallSession::new_incoming(
             &call_id,
@@ -106,7 +104,7 @@ impl<'a> AcceptCall<'a> {
     /// Build the [`CallEngine`] from the offer: decrypt the callKey over the Signal session, then
     /// assemble the incoming-call config from the parsed relay. No network I/O beyond the Signal
     /// session the decrypt needs.
-    async fn build_engine(&self) -> Result<(CallEngine, String), CallError> {
+    async fn build_engine(&self) -> Result<(CallEngine, String, SocketAddr), CallError> {
         let media = self.incoming.media.as_ref().ok_or(CallError::NotAnOffer)?;
         let CallAction::Offer {
             call_id,
@@ -158,20 +156,11 @@ impl<'a> AcceptCall<'a> {
 
         let config = CallConfig::for_incoming(call_id, &self_lid, &peer_lid, call_key, relay)
             .map_err(|e| CallError::Setup(e.to_string()))?;
+        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
+        let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok((engine, call_id.clone()))
-    }
-
-    /// The relay socket address from the offer's relay block.
-    fn relay_addr(&self) -> Result<SocketAddr, CallError> {
-        let relay = self
-            .incoming
-            .media
-            .as_ref()
-            .and_then(|m| m.relay.as_ref())
-            .ok_or(CallError::Media("offer carried no <relay>"))?;
-        relay_to_socket_addr(relay)
+        Ok((engine, call_id.clone(), addr))
     }
 }
 
@@ -179,14 +168,14 @@ impl<'a> AcceptCall<'a> {
 /// holds the peer and, once [`audio`](Self::audio) is called, the source/sink, then [`start`](Self::start)
 /// generates the callKey, encrypts it per peer device, sends the `<offer>`, and registers the call.
 /// Borrows the client so it can't outlive it.
-pub struct CallCall<'a> {
+pub struct OutgoingCall<'a> {
     pub(crate) client: &'a Client,
     pub(crate) peer: &'a Jid,
     source: Option<Arc<dyn AudioSource>>,
     sink: Option<Arc<dyn AudioSink>>,
 }
 
-impl<'a> CallCall<'a> {
+impl<'a> OutgoingCall<'a> {
     pub(crate) fn new(client: &'a Client, peer: &'a Jid) -> Self {
         Self {
             client,
@@ -459,7 +448,7 @@ async fn place_call(
             _session_guards.push(mutex.lock().await);
         }
 
-        // Sessions were asserted upstream (`CallCall::start`), so skip the network session-ensure and
+        // Sessions were asserted upstream (`OutgoingCall::start`), so skip the network session-ensure and
         // encrypt against the existing sessions directly: a device whose session is somehow still
         // missing fails its encrypt and is skipped, exactly as the old per-device loop did.
         let plan = wacore::send::SessionPlan::assume_ready(devices.len());
@@ -619,6 +608,8 @@ async fn place_call(
     Ok(CallHandle {
         call_id,
         generation,
+        peer_jid: peer.clone(),
+        call_creator: call_creator.clone(),
         client_registry: registry,
         pending_outgoing_calls: client.pending_outgoing_calls.clone(),
         muted,
@@ -761,15 +752,10 @@ pub(crate) struct PendingOutgoing {
     rekey_rx: async_channel::Receiver<String>,
 }
 
-/// The relay's primary IPv4 endpoint as a dial-able socket address. The same parse the config build
-/// already ran (`get_media_relay_endpoint` + `get_primary_ipv4_address`); a config build that
-/// succeeded guarantees these `Some`, so the errors here are belt-and-suspenders.
-fn relay_to_socket_addr(relay: &RelayData) -> Result<SocketAddr, CallError> {
-    let ep = wacore::voip::relay_parse::get_media_relay_endpoint(relay)
-        .ok_or(CallError::Media("relay has no endpoints"))?;
-    let (ip, port) = wacore::voip::relay_parse::get_primary_ipv4_address(ep)
-        .ok_or(CallError::Media("relay has no ipv4"))?;
-    format!("{ip}:{port}")
+/// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
+/// re-walking the relay block, which `CallConfig::for_*` already did into `relay_ip`/`relay_port`).
+fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError> {
+    format!("{}:{}", config.relay_ip, config.relay_port)
         .parse()
         .map_err(|_| CallError::Media("relay address is not a valid socket addr"))
 }
@@ -820,10 +806,10 @@ pub(crate) async fn attach_outgoing_relay(
             relay,
         )
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
+        let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map_err(|e| CallError::Setup(e.to_string()))?;
-
-        let addr = relay_to_socket_addr(relay)?;
         Ok::<_, CallError>((
             engine,
             RelayMediaChannelFactory::new(addr, client.runtime.clone()),
@@ -873,6 +859,8 @@ async fn spawn_call(
 ) -> Result<CallHandle, CallError> {
     // Register BEFORE connecting so the entry exists before the driver task can self-clean.
     let registry = client.call_registry();
+    let peer_jid = session.peer_jid.clone();
+    let call_creator = session.call_creator.clone();
     let generation = registry.insert(session);
 
     let muted = Arc::new(AtomicBool::new(false));
@@ -884,7 +872,7 @@ async fn spawn_call(
         move || ended.notify()
     });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
-    attach_engine(
+    if let Err(e) = attach_engine(
         client,
         &call_id,
         generation,
@@ -898,10 +886,18 @@ async fn spawn_call(
         // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
         None,
     )
-    .await?;
+    .await
+    {
+        // `insert` cleared the ringing flag, but a failed accept never answered the call. Restore the
+        // flag so a later peer <terminate> (the caller giving up) still surfaces a missed call.
+        client.call_registry().mark_incoming_ringing(&call_id);
+        return Err(e);
+    }
     Ok(CallHandle {
         call_id,
         generation,
+        peer_jid,
+        call_creator,
         client_registry: client.call_registry(),
         pending_outgoing_calls: client.pending_outgoing_calls.clone(),
         muted,
@@ -1067,13 +1063,18 @@ impl EndedFlag {
 }
 
 /// Opaque handle to a live call. Drop does NOT end the call (the driver task owns its own lifetime);
-/// call [`hangup`](Self::hangup) to tear it down. `#[non_exhaustive]`-style opacity: no public
-/// fields, so the surface can grow without breaking callers.
+/// call [`hangup`](Self::hangup) to tear it down. No public fields, so the surface can grow without
+/// breaking callers. `Clone` is cheap (shared `Arc` state); every clone controls the SAME live call.
+#[derive(Clone)]
 pub struct CallHandle {
     call_id: String,
     /// The registry generation this handle owns, so hangup only tears down THIS call and not a
     /// same-call-id replacement (glare/retry) that superseded it.
     generation: u64,
+    /// The call's peer and creator, kept so a consumer can drive `voip().terminate(..)` straight off
+    /// the handle without separately tracking the signaling metadata.
+    peer_jid: Jid,
+    call_creator: Jid,
     client_registry: Arc<wacore::voip::CallRegistry>,
     /// The same map `voip().call()` parked this call's relay-attach material in. A dormant outgoing
     /// hangup (engine not yet attached) must drop its entry here AND notify `ended` itself, since no
@@ -1089,6 +1090,16 @@ impl CallHandle {
     /// The call-id this handle controls.
     pub fn call_id(&self) -> &str {
         &self.call_id
+    }
+
+    /// The peer this call is with (the callee for an outgoing call, the caller for an incoming one).
+    pub fn peer_jid(&self) -> &Jid {
+        &self.peer_jid
+    }
+
+    /// The call's creator JID, as carried in the signaling (needed by `voip().terminate(..)`).
+    pub fn call_creator(&self) -> &Jid {
+        &self.call_creator
     }
 
     /// Mute or unmute the local microphone. While muted the engine sends DTX comfort-noise (the
@@ -1143,6 +1154,10 @@ impl CallHandle {
     }
 
     /// Subscribe to the call's engine events (relay allocate, foreign-audio, allocate failures).
+    ///
+    /// All receivers returned here (and across cloned handles) share ONE queue: each event is
+    /// delivered to exactly one receiver, competitively. Drive a single consumer loop per call;
+    /// polling two receivers concurrently splits the events between them rather than broadcasting.
     pub fn events(&self) -> async_channel::Receiver<CallEvent> {
         self.events.clone()
     }
@@ -1171,19 +1186,7 @@ mod tests {
     use crate::test_utils::{MockHttpClient, create_test_backend};
 
     async fn make_client() -> Arc<Client> {
-        let backend = create_test_backend().await;
-        let pm = PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager");
-        let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let client = crate::test_utils::create_test_client().await;
         // The facade's connect path gates on is_connected; mark connected for the unit tests.
         client.set_connected_for_test(true);
         client
@@ -2206,6 +2209,8 @@ mod tests {
         let handle = CallHandle {
             call_id: "CID-FACADE".into(),
             generation,
+            peer_jid: caller(),
+            call_creator: caller(),
             client_registry: client.call_registry(),
             pending_outgoing_calls: client.pending_outgoing_calls.clone(),
             muted: muted.clone(),
