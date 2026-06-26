@@ -1100,7 +1100,7 @@ impl CallHandle {
     /// peer the offer rang. Returns owned so it can merge the answering device tracked on the registry.
     pub fn peer_jid(&self) -> Jid {
         self.client_registry
-            .answering_device(&self.call_id)
+            .answering_device_if_current(&self.call_id, self.generation)
             .unwrap_or_else(|| self.peer_jid.clone())
     }
 

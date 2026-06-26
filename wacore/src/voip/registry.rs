@@ -187,12 +187,15 @@ impl CallRegistry {
         }
     }
 
-    /// The callee device that answered an outgoing call, if one has, for addressing a `<terminate>`.
-    pub fn answering_device(&self, call_id: &str) -> Option<Jid> {
+    /// The callee device that answered the call registered under `generation`, if one has, for
+    /// addressing a `<terminate>`. Generation-guarded so a stale handle (superseded by a same-call-id
+    /// replacement) can't read the newer call's device; it falls back to its own bare peer instead.
+    pub fn answering_device_if_current(&self, call_id: &str, generation: u64) -> Option<Jid> {
         self.inner
             .lock()
             .expect("registry lock poisoned")
             .get(call_id)
+            .filter(|e| e.generation == generation)
             .and_then(|e| e.session.answering_device.clone())
     }
 
@@ -334,18 +337,31 @@ mod tests {
     }
 
     #[test]
-    fn answering_device_is_set_once_and_read_back() {
+    fn answering_device_is_set_once_and_generation_guarded() {
         let reg = CallRegistry::new();
-        assert_eq!(reg.answering_device("CID"), None, "unknown call has none");
-        reg.insert(session("CID"));
-        assert_eq!(reg.answering_device("CID"), None, "none until an accept");
+        assert_eq!(reg.answering_device_if_current("CID", 0), None, "unknown");
+        let g = reg.insert(session("CID"));
+        assert_eq!(
+            reg.answering_device_if_current("CID", g),
+            None,
+            "none until an accept"
+        );
         let dev = Jid::new("222222222222222", Server::Lid).with_device(2);
         reg.set_answering_device("CID", dev.clone());
-        assert_eq!(reg.answering_device("CID"), Some(dev.clone()));
+        assert_eq!(reg.answering_device_if_current("CID", g), Some(dev.clone()));
         // First answerer wins: a later accept from another device is ignored.
         let other = Jid::new("222222222222222", Server::Lid).with_device(5);
         reg.set_answering_device("CID", other);
-        assert_eq!(reg.answering_device("CID"), Some(dev));
+        assert_eq!(reg.answering_device_if_current("CID", g), Some(dev.clone()));
+        // A replacement under a new generation isolates the device: the stale generation reads None.
+        let g2 = reg.insert(session("CID"));
+        assert_ne!(g, g2);
+        assert_eq!(
+            reg.answering_device_if_current("CID", g),
+            None,
+            "a stale generation must not read the replacement's device"
+        );
+        assert_eq!(reg.answering_device_if_current("CID", g2), None);
     }
 
     #[test]
