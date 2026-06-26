@@ -359,9 +359,15 @@ pub fn get_outbound_relay_endpoints(relay_data: &RelayData) -> Vec<RelayEndpoint
 /// same relay block could carry. If nothing is usable, fall back to the prior selection so
 /// `CallConfig::from_relay` still surfaces a precise NoRelayIpv4/NoRelayToken error.
 pub fn get_media_relay_endpoint(relay_data: &RelayData) -> Option<&RelayEndpoint> {
+    // A sparse `token id=...` block pads the missing lower indices with empty Vecs (parse_indexed_tokens),
+    // so an endpoint referencing a never-sent token_id has a present-but-empty slot. Treat that as no
+    // token, or a padded slot would mask a later endpoint whose token the relay actually provided.
     let usable = |e: &RelayEndpoint| {
         get_primary_ipv4_address(e).is_some()
-            && relay_data.relay_tokens.get(e.token_id as usize).is_some()
+            && relay_data
+                .relay_tokens
+                .get(e.token_id as usize)
+                .is_some_and(|t| !t.is_empty())
     };
     let pick = |usable_only: bool| {
         relay_data
@@ -576,6 +582,33 @@ mod tests {
         };
         let selected = get_media_relay_endpoint(&rd).expect("a usable endpoint must be selectable");
         assert_eq!(selected.relay_name, "usable");
+    }
+
+    #[test]
+    fn media_relay_treats_padded_empty_token_slot_as_missing() {
+        let addr = |ip: &str| RelayAddress {
+            protocol: 0,
+            ipv4: Some(ip.into()),
+            ipv6: None,
+            port: 3478,
+        };
+        let ep = |name: &str, token_id: u32, ip: &str| RelayEndpoint {
+            relay_name: name.into(),
+            token_id,
+            auth_token_id: 1,
+            addresses: vec![addr(ip)],
+            ..RelayEndpoint::default()
+        };
+        // Only `token id="1"` was provided; parse_indexed_tokens pads index 0 with an empty Vec. The
+        // preferred endpoint references that padded slot, so it must be skipped for the real token at 1.
+        let rd = RelayData {
+            relay_tokens: vec![Vec::new(), vec![0xAA]],
+            endpoints: vec![ep("padded", 0, "1.2.3.4"), ep("real", 1, "5.6.7.8")],
+            ..RelayData::default()
+        };
+        let selected =
+            get_media_relay_endpoint(&rd).expect("the real-token endpoint must be picked");
+        assert_eq!(selected.relay_name, "real");
     }
 
     #[test]

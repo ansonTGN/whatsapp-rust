@@ -193,9 +193,13 @@ impl CallConfig {
         let ep = relay_parse::get_media_relay_endpoint(relay).ok_or(SetupError::NoRelayEndpoint)?;
         let (relay_ip, relay_port) =
             relay_parse::get_primary_ipv4_address(ep).ok_or(SetupError::NoRelayIpv4)?;
+        // A padded-empty slot (a sparse token block) is a missing token, not a zero-length one: reject
+        // it here so the nothing-usable fallback surfaces a precise NoRelayToken instead of dialing the
+        // relay with an empty token and failing at the allocate.
         let relay_token = relay
             .relay_tokens
             .get(ep.token_id as usize)
+            .filter(|t| !t.is_empty())
             .cloned()
             .ok_or(SetupError::NoRelayToken(ep.token_id))?;
         // The relay <key> is the STUN MESSAGE-INTEGRITY key; without it the allocate/binding-success
@@ -859,6 +863,13 @@ mod tests {
         assert!(matches!(
             CallConfig::for_incoming("CID", SELF_LID, PEER_LID, (0u8..32).collect(), &no_ep),
             Err(SetupError::NoRelayEndpoint)
+        ));
+        // A padded-empty token slot (sparse token block) is a missing token, not a zero-length one.
+        let mut empty_token = relay.clone();
+        empty_token.relay_tokens = vec![Vec::new()];
+        assert!(matches!(
+            CallConfig::for_incoming("CID", SELF_LID, PEER_LID, (0u8..32).collect(), &empty_token),
+            Err(SetupError::NoRelayToken(0))
         ));
     }
 
