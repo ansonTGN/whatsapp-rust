@@ -560,6 +560,15 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
+    /// SHORTCAKE_PASSKEY linking flow state: the pending handoff key, the
+    /// per-attempt ephemeral linking cache, and the optional host authenticator.
+    pub(crate) passkey_state: Arc<Mutex<crate::passkey::flow::PasskeyFlowState>>,
+
+    /// Wait-free "an open is in flight" reservation for the passkey flow. Kept
+    /// outside `passkey_state` so it can be released synchronously on drop (a
+    /// cancelled open can't leave it stuck), unlike a flag behind the async lock.
+    pub(crate) passkey_opening: AtomicBool,
+
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
