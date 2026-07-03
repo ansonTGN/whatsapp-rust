@@ -2951,16 +2951,29 @@ impl ProtocolStore for SqliteStore {
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
         tokio::task::spawn_blocking(move || -> Result<u32> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // Remove a row only when its received token is expired-or-absent AND
+            // its sender bucket is expired-or-absent, so recent sender state
+            // survives an expired received token (and vice versa). A null
+            // sender_timestamp counts as stale.
             let deleted = diesel::delete(
                 tc_tokens::table
-                    .filter(tc_tokens::token_timestamp.lt(cutoff_timestamp))
+                    .filter(
+                        tc_tokens::token
+                            .eq(Vec::<u8>::new())
+                            .or(tc_tokens::token_timestamp.lt(token_cutoff)),
+                    )
+                    .filter(
+                        tc_tokens::sender_timestamp
+                            .is_null()
+                            .or(tc_tokens::sender_timestamp.lt(sender_cutoff)),
+                    )
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
             .execute(&mut conn)
@@ -2969,6 +2982,99 @@ impl ProtocolStore for SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let jid = jid.to_string();
+        let token = token.to_vec();
+        let now = wacore::time::now_secs();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // On conflict update only the token fields so a sender_timestamp
+            // written concurrently by the issuance path survives.
+            diesel::insert_into(tc_tokens::table)
+                .values((
+                    tc_tokens::jid.eq(&jid),
+                    tc_tokens::token.eq(&token),
+                    tc_tokens::token_timestamp.eq(token_timestamp),
+                    tc_tokens::sender_timestamp.eq(None::<i64>),
+                    tc_tokens::device_id.eq(device_id),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .on_conflict((tc_tokens::jid, tc_tokens::device_id))
+                .do_update()
+                .set((
+                    tc_tokens::token.eq(&token),
+                    tc_tokens::token_timestamp.eq(token_timestamp),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
+    }
+
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let jid = jid.to_string();
+        let now = wacore::time::now_secs();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // On conflict touch only sender_timestamp, and only to advance it,
+            // so a concurrently stored real token is never overwritten and the
+            // sender bucket never regresses.
+            diesel::insert_into(tc_tokens::table)
+                .values((
+                    tc_tokens::jid.eq(&jid),
+                    tc_tokens::token.eq(Vec::<u8>::new()),
+                    tc_tokens::token_timestamp.eq(sender_timestamp),
+                    tc_tokens::sender_timestamp.eq(Some(sender_timestamp)),
+                    tc_tokens::device_id.eq(device_id),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .on_conflict((tc_tokens::jid, tc_tokens::device_id))
+                .do_update()
+                .set((
+                    // MAX(...) keeps the sender bucket advance-only; there is no
+                    // typed Diesel form for a scalar MAX, and `ON CONFLICT ...
+                    // WHERE` isn't expressible via the query builder.
+                    tc_tokens::sender_timestamp.eq(diesel::dsl::sql::<
+                        diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                    >(
+                        "MAX(COALESCE(sender_timestamp, "
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(sender_timestamp)
+                    .sql("), ")
+                    .bind::<diesel::sql_types::BigInt, _>(sender_timestamp)
+                    .sql(")")),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
     }
 
     async fn store_sent_message(
@@ -4116,6 +4222,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_touch_and_store_received_preserve_each_others_field() {
+        let store = create_test_store().await;
+
+        // Issuance writes a placeholder; the notification then stores the real
+        // token. Neither write may clobber the other's field.
+        store
+            .touch_tc_token_sender_timestamp("user@lid", 5000)
+            .await
+            .unwrap();
+        store
+            .store_received_tc_token("user@lid", &[7, 8, 9], 4000)
+            .await
+            .unwrap();
+        let a = store.get_tc_token("user@lid").await.unwrap().unwrap();
+        assert_eq!(a.token, vec![7, 8, 9]);
+        assert_eq!(a.token_timestamp, 4000);
+        assert_eq!(a.sender_timestamp, Some(5000));
+
+        // A later touch advances only the sender bucket.
+        store
+            .touch_tc_token_sender_timestamp("user@lid", 6000)
+            .await
+            .unwrap();
+        let b = store.get_tc_token("user@lid").await.unwrap().unwrap();
+        assert_eq!(b.token, vec![7, 8, 9], "touch must keep the real token");
+        assert_eq!(b.sender_timestamp, Some(6000));
+
+        // An older touch must not regress the sender bucket.
+        store
+            .touch_tc_token_sender_timestamp("user@lid", 1000)
+            .await
+            .unwrap();
+        let c = store.get_tc_token("user@lid").await.unwrap().unwrap();
+        assert_eq!(c.sender_timestamp, Some(6000), "touch is advance-only");
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_two_window_pruning() {
+        let store = create_test_store().await;
+        // token_cutoff = 1000, sender_cutoff = 2000.
+
+        // Recent placeholder: sender bucket live → kept.
+        store
+            .touch_tc_token_sender_timestamp("recent_ph@lid", 2500)
+            .await
+            .unwrap();
+        // Stale placeholder: both windows passed → pruned.
+        store
+            .touch_tc_token_sender_timestamp("stale_ph@lid", 100)
+            .await
+            .unwrap();
+        // Expired received token but recent sender bucket → kept.
+        store
+            .put_tc_token(
+                "expired_live_sender@lid",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: Some(2500),
+                },
+            )
+            .await
+            .unwrap();
+        // Expired token, no sender state → pruned.
+        store
+            .put_tc_token(
+                "orphan_expired@lid",
+                &TcTokenEntry {
+                    token: vec![2],
+                    token_timestamp: 1,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let removed = store.delete_expired_tc_tokens(1000, 2000).await.unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.get_tc_token("recent_ph@lid").await.unwrap().is_some());
+        assert!(store.get_tc_token("stale_ph@lid").await.unwrap().is_none());
+        assert!(
+            store
+                .get_tc_token("expired_live_sender@lid")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_tc_token("orphan_expired@lid")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_tc_token_get_all_jids() {
         let store = create_test_store().await;
 
@@ -4150,7 +4353,8 @@ mod tests {
         store.put_tc_token("old@lid", &old).await.unwrap();
         store.put_tc_token("recent@lid", &recent).await.unwrap();
 
-        let deleted = store.delete_expired_tc_tokens(3000).await.unwrap();
+        // Both lack sender state, so the token window alone decides.
+        let deleted = store.delete_expired_tc_tokens(3000, 3000).await.unwrap();
         assert_eq!(deleted, 1);
 
         assert!(store.get_tc_token("old@lid").await.unwrap().is_none());

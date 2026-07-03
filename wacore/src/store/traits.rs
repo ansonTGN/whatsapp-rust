@@ -451,8 +451,73 @@ pub trait ProtocolStore: Send + Sync {
     /// Get all JIDs that have stored tc tokens.
     async fn get_all_tc_token_jids(&self) -> Result<Vec<String>>;
 
-    /// Delete tc tokens with token_timestamp older than cutoff. Returns count deleted.
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32>;
+    /// Delete tc tokens that have no live state left. A row is removed only when
+    /// its received token is expired-or-absent (`token_timestamp < token_cutoff`
+    /// or empty) **and** its sender bucket is expired-or-absent
+    /// (`sender_timestamp < sender_cutoff` or null), so recent sender state is
+    /// never dropped just because the received token expired. Returns count deleted.
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32>;
+
+    /// Advance `sender_timestamp` toward `sender_timestamp` for a contact,
+    /// inserting a byte-less placeholder when absent and preserving any existing
+    /// token bytes. The stored value only ever moves forward (max), so
+    /// concurrent writers (post-send issuance, history sync) converge regardless
+    /// of ordering and never regress the sender bucket.
+    ///
+    /// Must be atomic w.r.t. [`put_tc_token`](Self::put_tc_token): the sender-side
+    /// issuance path and the notification writer both touch the same row, so a
+    /// non-atomic read-modify-write could drop a real token for a placeholder.
+    /// The default is a read-modify-write for third-party backends; the built-in
+    /// stores override it with a single atomic upsert.
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let entry = match self.get_tc_token(jid).await? {
+            Some(existing) => TcTokenEntry {
+                sender_timestamp: Some(
+                    existing
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                ),
+                ..existing
+            },
+            None => TcTokenEntry {
+                token: Vec::new(),
+                token_timestamp: sender_timestamp,
+                sender_timestamp: Some(sender_timestamp),
+            },
+        };
+        self.put_tc_token(jid, &entry).await
+    }
+
+    /// Store a token received from a contact, preserving any existing
+    /// `sender_timestamp`. The symmetric counterpart of
+    /// [`touch_tc_token_sender_timestamp`](Self::touch_tc_token_sender_timestamp):
+    /// each writer owns its own field, so the notification path never drops a
+    /// sender bucket that the issuance path wrote concurrently. Same atomicity
+    /// requirement — the default read-modify-write is for third-party backends.
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let sender_timestamp = self
+            .get_tc_token(jid)
+            .await?
+            .and_then(|existing| existing.sender_timestamp);
+        self.put_tc_token(
+            jid,
+            &TcTokenEntry {
+                token: token.to_vec(),
+                token_timestamp,
+                sender_timestamp,
+            },
+        )
+        .await
+    }
 
     // --- Sent Message Store (retry support, matches WA Web's getMessageTable) ---
 

@@ -564,12 +564,72 @@ impl ProtocolStore for InMemoryBackend {
         Ok(self.state.lock().await.tc_tokens.keys().cloned().collect())
     }
 
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
         let mut s = self.state.lock().await;
         let before = s.tc_tokens.len();
-        s.tc_tokens
-            .retain(|_, entry| entry.token_timestamp >= cutoff_timestamp);
+        // Keep a row while either window is still live: the received token or the
+        // sender bucket. A row is dropped only when both are stale.
+        s.tc_tokens.retain(|_, entry| {
+            let token_live = !entry.token.is_empty() && entry.token_timestamp >= token_cutoff;
+            let sender_live = entry.sender_timestamp.is_some_and(|ts| ts >= sender_cutoff);
+            token_live || sender_live
+        });
         Ok((before - s.tc_tokens.len()) as u32)
+    }
+
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        match s.tc_tokens.get_mut(jid) {
+            Some(entry) => {
+                entry.sender_timestamp = Some(
+                    entry
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                );
+            }
+            None => {
+                s.tc_tokens.insert(
+                    jid.to_string(),
+                    TcTokenEntry {
+                        token: Vec::new(),
+                        token_timestamp: sender_timestamp,
+                        sender_timestamp: Some(sender_timestamp),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        match s.tc_tokens.get_mut(jid) {
+            Some(entry) => {
+                entry.token = token.to_vec();
+                entry.token_timestamp = token_timestamp;
+                // sender_timestamp left untouched
+            }
+            None => {
+                s.tc_tokens.insert(
+                    jid.to_string(),
+                    TcTokenEntry {
+                        token: token.to_vec(),
+                        token_timestamp,
+                        sender_timestamp: None,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     // --- Sent Message Store ---
@@ -1090,5 +1150,173 @@ mod tests {
             vec![9u8; 32],
             "last write wins for the same composite key"
         );
+    }
+
+    #[tokio::test]
+    async fn touch_tc_token_creates_placeholder_then_preserves_real_token() {
+        let backend = InMemoryBackend::new();
+
+        backend
+            .touch_tc_token_sender_timestamp("u1", 1000)
+            .await
+            .unwrap();
+        let placeholder = backend.get_tc_token("u1").await.unwrap().unwrap();
+        assert!(placeholder.token.is_empty());
+        assert_eq!(placeholder.sender_timestamp, Some(1000));
+
+        // A real token stored by the notification path must survive a later touch.
+        backend
+            .put_tc_token(
+                "u1",
+                &TcTokenEntry {
+                    token: vec![7, 8, 9],
+                    token_timestamp: 2000,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .touch_tc_token_sender_timestamp("u1", 3000)
+            .await
+            .unwrap();
+
+        let merged = backend.get_tc_token("u1").await.unwrap().unwrap();
+        assert_eq!(
+            merged.token,
+            vec![7, 8, 9],
+            "touch must not clobber the real token"
+        );
+        assert_eq!(merged.token_timestamp, 2000);
+        assert_eq!(merged.sender_timestamp, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn touch_sender_timestamp_only_advances() {
+        let backend = InMemoryBackend::new();
+        backend
+            .touch_tc_token_sender_timestamp("uadv", 5000)
+            .await
+            .unwrap();
+        // An older touch (e.g. a stale history-sync sender epoch) must not regress.
+        backend
+            .touch_tc_token_sender_timestamp("uadv", 3000)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_tc_token("uadv")
+                .await
+                .unwrap()
+                .unwrap()
+                .sender_timestamp,
+            Some(5000)
+        );
+    }
+
+    #[tokio::test]
+    async fn store_received_tc_token_preserves_sender_timestamp() {
+        let backend = InMemoryBackend::new();
+        // Placeholder from the issuance path.
+        backend
+            .touch_tc_token_sender_timestamp("u2", 5000)
+            .await
+            .unwrap();
+
+        // Notification stores the real token; the sender bucket must survive.
+        backend
+            .store_received_tc_token("u2", &[1, 2, 3], 4000)
+            .await
+            .unwrap();
+
+        let entry = backend.get_tc_token("u2").await.unwrap().unwrap();
+        assert_eq!(entry.token, vec![1, 2, 3]);
+        assert_eq!(entry.token_timestamp, 4000);
+        assert_eq!(
+            entry.sender_timestamp,
+            Some(5000),
+            "store_received_tc_token must not drop the sender bucket"
+        );
+
+        // No prior entry: sender_timestamp starts unset.
+        backend
+            .store_received_tc_token("u3", &[9], 4000)
+            .await
+            .unwrap();
+        let fresh = backend.get_tc_token("u3").await.unwrap().unwrap();
+        assert_eq!(fresh.sender_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn prune_respects_sender_and_token_windows() {
+        let backend = InMemoryBackend::new();
+        // token_cutoff = 1000, sender_cutoff = 2000 (wider sender window).
+
+        // Recent placeholder: sender bucket still live → kept.
+        backend
+            .touch_tc_token_sender_timestamp("recent_ph", 2500)
+            .await
+            .unwrap();
+        // Stale placeholder: both windows passed → pruned.
+        backend
+            .touch_tc_token_sender_timestamp("stale_ph", 100)
+            .await
+            .unwrap();
+        // Expired token but recent sender bucket → kept (issuance state survives).
+        backend
+            .put_tc_token(
+                "expired_tok_live_sender",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: Some(2500),
+                },
+            )
+            .await
+            .unwrap();
+        // Expired token, no sender state → pruned.
+        backend
+            .put_tc_token(
+                "orphan_expired",
+                &TcTokenEntry {
+                    token: vec![2],
+                    token_timestamp: 1,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Fresh received token → kept.
+        backend
+            .put_tc_token(
+                "fresh_tok",
+                &TcTokenEntry {
+                    token: vec![3],
+                    token_timestamp: 5000,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let removed = backend.delete_expired_tc_tokens(1000, 2000).await.unwrap();
+        assert_eq!(removed, 2, "only fully-stale rows are pruned");
+        assert!(backend.get_tc_token("recent_ph").await.unwrap().is_some());
+        assert!(backend.get_tc_token("stale_ph").await.unwrap().is_none());
+        assert!(
+            backend
+                .get_tc_token("expired_tok_live_sender")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_tc_token("orphan_expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(backend.get_tc_token("fresh_tok").await.unwrap().is_some());
     }
 }
