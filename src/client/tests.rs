@@ -208,6 +208,107 @@ async fn test_ack_without_matching_waiter() {
     );
 }
 
+/// Every server `<ack>` with an id dispatches an observe-only
+/// `Event::ServerAck` carrying the ack's class/from/t, independent of
+/// waiter state; a nack carries its error code. Lets consumers measure
+/// send → server-accept latency and see nack codes programmatically
+/// instead of scraping warn! logs.
+#[tokio::test]
+async fn test_ack_dispatches_server_ack_event() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+
+    // Plain message ack (no waiter registered): event fires with the ack's
+    // class, from and server timestamp; error is None.
+    let ack_node = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-1")
+        .attr("class", "message")
+        .attr("from", "123456789@s.whatsapp.net")
+        .attr("t", "1720000000")
+        .build();
+    client.handle_ack_response(&ack_node.as_node_ref()).await;
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack)
+                if ack.id == "ack-evt-1"
+                    && ack.class == "message"
+                    && ack.from.as_ref().is_some_and(|j| j.to_string() == "123456789@s.whatsapp.net")
+                    && ack.timestamp.is_some_and(|t| t.timestamp() == 1_720_000_000)
+                    && ack.error.is_none()
+        )),
+        "server <ack> should dispatch Event::ServerAck with class/from/t"
+    );
+
+    // Nack: the error code rides along; absent class/t stay empty/None.
+    let nack_node = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-2")
+        .attr("error", "479")
+        .attr("from", SERVER_JID)
+        .build();
+    client.handle_ack_response(&nack_node.as_node_ref()).await;
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack)
+                if ack.id == "ack-evt-2"
+                    && ack.class.is_empty()
+                    && ack.timestamp.is_none()
+                    && ack.error.as_deref() == Some("479")
+        )),
+        "server nack should dispatch Event::ServerAck carrying the error code"
+    );
+
+    // An ack without an id (e.g. non-message acks) dispatches nothing.
+    let anon_ack = NodeBuilder::new("ack").attr("from", SERVER_JID).build();
+    client.handle_ack_response(&anon_ack.as_node_ref()).await;
+    assert_eq!(
+        collector
+            .events()
+            .iter()
+            .filter(|e| matches!(e.as_ref(), Event::ServerAck(_)))
+            .count(),
+        2,
+        "an <ack> without an id must not dispatch Event::ServerAck"
+    );
+
+    // The headline guarantee: with a waiter registered for the same id, the
+    // event STILL fires and the waiter STILL resolves — dispatch and waiter
+    // resolution are independent.
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert("ack-evt-3".to_string(), tx);
+    let waited_ack = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-3")
+        .attr("class", "message")
+        .attr("from", SERVER_JID)
+        .build();
+    let handled = client.handle_ack_response(&waited_ack.as_node_ref()).await;
+    assert!(handled, "waiter for the id should have been resolved");
+    let resolved = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("timed out waiting for ack waiter")
+        .expect("waiter sender was dropped");
+    assert!(
+        resolved
+            .get()
+            .get_attr("id")
+            .is_some_and(|v| v.as_str() == "ack-evt-3"),
+        "waiter should receive the ack node"
+    );
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack) if ack.id == "ack-evt-3"
+        )),
+        "Event::ServerAck should fire even when a waiter consumes the ack"
+    );
+}
+
 /// Test that the lid_pn_cache correctly stores and retrieves LID mappings.
 ///
 /// This is critical for the LID-PN session mismatch fix. When we receive a message
