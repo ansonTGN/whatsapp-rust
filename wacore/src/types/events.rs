@@ -1455,6 +1455,11 @@ pub struct NewsletterLiveUpdate {
 }
 
 /// A single message entry in a newsletter live update.
+///
+/// The notification IR confirms this handler but does not expose a structured
+/// child shape. Until a sanitized capture or bundle evidence establishes more,
+/// this event retains the reaction data supported before history expansion;
+/// history counters and poll tallies must not be inferred as live fields.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterLiveUpdateMessage {

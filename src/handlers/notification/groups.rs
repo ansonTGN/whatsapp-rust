@@ -386,20 +386,14 @@ fn handle_groups_dirty(client: &Arc<Client>, groups: Vec<wacore_binary::Jid>) {
         .detach();
 }
 
-/// Handle `<notification type="newsletter">` — live updates with reaction counts.
+/// Handle `<notification type="newsletter">` live updates.
 ///
-/// Format:
-/// ```xml
-/// <notification from="NL_JID" type="newsletter" id="..." t="...">
-///   <live_updates>
-///     <messages jid="NL_JID" t="...">
-///       <message server_id="123" ...>
-///         <reactions><reaction code="👍" count="3"/></reactions>
-///       </message>
-///     </messages>
-///   </live_updates>
-/// </notification>
-/// ```
+/// The pinned and latest notif IR confirm the notification type and handler,
+/// but expose no structured fields for `<live_updates>`. Without a sanitized
+/// capture or raw bundle evidence, history IQ children must not be inferred to
+/// be live-update children. This handler therefore retains the previously
+/// supported reaction shape only and always forwards the raw notification too.
+/// The server id is the correlation key for that established reaction update.
 pub(crate) fn handle_newsletter_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     use crate::features::newsletter::parse_reaction_counts;
     use wacore::types::events::{
