@@ -571,14 +571,15 @@ impl Client {
             learning_source: entry.learning_source.as_str().to_string(),
         };
 
+        // Migration deletes PN-keyed durable state. Keep it intact if the
+        // mapping write fails, so a restarted client can still find that state
+        // by PN; the in-memory pair stays unmarked and a later live learn retries.
         self.persistence_manager
             .backend()
             .put_lid_mapping(&storage_entry)
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
 
-        // After the write, not before: a failed persist stays un-marked so the
-        // next live message retries instead of skipping.
         self.lid_pn_cache
             .mark_persisted(&entry.phone_number, &entry.lid)
             .await;
@@ -788,13 +789,10 @@ impl Client {
     /// wire addressing on every process start until the fetch lands, flapping
     /// the DM namespace. Persisting the observation makes the state durable,
     /// like WA Web's pref outliving the prop.
-    pub(crate) async fn latch_lid_migrated_from_props(&self) {
-        if !self.persistence_manager.get_device_snapshot().lid_migrated
-            && self
-                .ab_props()
-                .is_enabled(wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED)
-                .await
-        {
+    /// Persist the value captured with the accepted props response, even if
+    /// the connection changes before the device command runs.
+    pub(crate) async fn latch_lid_migrated_observation(&self, observed: bool) {
+        if observed && !self.persistence_manager.get_device_snapshot().lid_migrated {
             log::info!("Account is 1:1-LID-migrated (ab prop observation)");
             self.persistence_manager
                 .process_command(crate::store::commands::DeviceCommand::SetLidMigrated(true))
@@ -1796,7 +1794,7 @@ mod tests {
         let client: Arc<Client> = create_test_client().await;
 
         // Prop absent: nothing latched.
-        client.latch_lid_migrated_from_props().await;
+        client.latch_lid_migrated_observation(false).await;
         assert!(
             !client
                 .persistence_manager
@@ -1816,11 +1814,17 @@ mod tests {
                 )),
             )
             .await;
-        client.latch_lid_migrated_from_props().await;
+        let observed = client
+            .ab_props()
+            .snapshot()
+            .await
+            .is_enabled(wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED);
+        client.ab_props().begin_generation(1).await;
         client
             .ab_props()
             .apply_props(false, std::iter::empty())
             .await;
+        client.latch_lid_migrated_observation(observed).await;
         assert!(
             client
                 .persistence_manager

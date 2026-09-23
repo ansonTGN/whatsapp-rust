@@ -42,8 +42,12 @@ use crate::client::Client;
 use super::traits::StanzaHandler;
 use wacore::stanza::wire_tags::StanzaTag;
 
-/// Router sends the generic `<ack>` via `should_ack`, so this handler only
-/// parses and dispatches. On `Offer` it also emits the `<receipt><offer/></receipt>`
+#[cfg(test)]
+mod identity_tests;
+pub(crate) mod pending_offers;
+
+/// Router sends the generic `<ack>` via `should_ack`; this handler parses,
+/// learns caller identity and dispatches. On `Offer` it emits the `<receipt><offer/></receipt>`
 /// ack-of-offer so the caller's signaling layer knows the device received the ring.
 #[derive(Default)]
 pub struct CallHandler;
@@ -194,6 +198,7 @@ impl StanzaHandler for CallHandler {
                 let is_offer = matches!(call.action, CallAction::Offer { .. });
                 let is_offer_notice = matches!(call.action, CallAction::OfferNotice { .. });
                 if (is_offer || is_offer_notice) && call.offline {
+                    learn_offer_identity(&client, &call).await;
                     // Offline-queue replay (an offer or a group-call offer_notice): the call is long
                     // dead (no relay, not connectable). Don't ack or ring it -- surface a non-ringing
                     // missed-call so a consumer can't auto-accept it (WA Web drops the stale notice
@@ -208,13 +213,22 @@ impl StanzaHandler for CallHandler {
                             MissedReason::Offline,
                         )));
                 } else {
+                    // Signal-only clients have no VoIP registry; keep the offer's
+                    // liveness through the receipt and identity-learning awaits.
+                    // The guard also removes an offer if its handler is cancelled.
+                    let pending_offer = is_offer
+                        .then(|| client.pending_call_offers.register(call.action.call_id()));
+                    if matches!(call.action, CallAction::Terminate { .. }) {
+                        client.pending_call_offers.terminate(call.action.call_id());
+                    }
                     // Track an incoming offer as ringing so only an UNANSWERED <terminate> later
                     // surfaces a missed call; an answered, outgoing, or duplicate terminate must not.
                     // Mirrors WA Web's _ringingCalls. The offline branch above already surfaced its
                     // own missed-offline, so it is intentionally not marked here. Mark BEFORE the
-                    // offer-ack await: <call> stanzas are processed concurrently, so a fast <terminate>
-                    // for this offer racing the await must see the ringing flag (else its missed-call
-                    // is lost and we'd set a stale flag after the call already ended).
+                    // identity-learning and offer-ack awaits: <call> stanzas are processed
+                    // concurrently, so a fast <terminate> racing the await must see the
+                    // ringing flag (else its missed-call is lost and we'd set a stale flag
+                    // after the call already ended).
                     #[cfg(feature = "voip-control")]
                     let mut duplicate_active_group_offer = false;
                     #[cfg(feature = "voip-control")]
@@ -264,6 +278,7 @@ impl StanzaHandler for CallHandler {
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
+                    learn_offer_identity(&client, &call).await;
                     #[cfg(feature = "voip-control")]
                     if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
                         &call.action
@@ -1037,7 +1052,12 @@ impl StanzaHandler for CallHandler {
                         // Keep the transition serialized through every committed side effect.
                         drop(event_permit);
                     }
-                    if dispatch_call {
+                    #[cfg(feature = "voip-control")]
+                    if is_offer && !client.call_registry().is_ringing(call.action.call_id()) {
+                        dispatch_call = false;
+                    }
+                    if dispatch_call && pending_offer.as_ref().is_none_or(|offer| offer.is_alive())
+                    {
                         client
                             .core
                             .event_bus
@@ -1573,6 +1593,70 @@ async fn dismiss_incompatible_group_invitee(client: &Client, call: &IncomingCall
 #[cfg(feature = "voip-control")]
 fn same_device(a: &Jid, b: &Jid) -> bool {
     a.user == b.user && a.server == b.server && a.device == b.device
+}
+
+/// WAWebVoipLidUtils associates caller_pn with peer_jid (the outer `from`),
+/// independently of call-creator. Learn before online/offline event dispatch;
+/// the shared fast path owns persistence, migration, and conflict reconciliation.
+async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
+    use crate::lid_pn_cache::LearningSource;
+    use wacore::iq::abprops::web;
+
+    let CallAction::Offer {
+        caller_pn: Some(pn),
+        ..
+    } = &call.action
+    else {
+        return;
+    };
+    let peer = &call.from;
+    if !peer.server.is_lid_family()
+        || !pn.server.is_pn_family()
+        || peer.user.is_empty()
+        || pn.user.is_empty()
+    {
+        return;
+    }
+
+    // The linked-device client has no guest-viewer mode. For authenticated
+    // viewers, WA Web skips this mapping when a nonempty username is supplied
+    // and both display and calling-PN-privacy gates are enabled. An enabled
+    // fetch must have applied in this connection before disclosing a username
+    // offer; disabling fetches preserves any already-cached server values.
+    // Its asMaybeUsername is a presence check, not full username validation.
+    let has_username = call
+        .caller_username
+        .as_deref()
+        .is_some_and(|username| !username.is_empty());
+    if has_username {
+        let privacy = client.ab_props.snapshot().await;
+        if (client.ab_props_fetch_enabled() && !privacy.applied_in_generation())
+            || (privacy.is_enabled(web::USERNAME_CONTACT_DISPLAY)
+                && privacy.is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY))
+        {
+            return;
+        }
+    }
+
+    // WA Web's "voip-lid" takes createLidPnMappings' default policy: seed
+    // unknown LIDs, and reconcile known conflicts via usync instead of replacing
+    // them. Other supplies that policy without extending the public source enum.
+    // Offline replay retains cache-only semantics. For a live offer, wait until
+    // the shared path persists the pair and completes PN-keyed Signal/session
+    // migrations before dispatch can trigger decryption through the new LID.
+    let result = if call.offline {
+        client
+            .learn_lid_pn_mapping_fast(&peer.user, &pn.user, LearningSource::Other, true)
+            .await;
+        Ok(())
+    } else {
+        client
+            .add_lid_pn_mapping(&peer.user, &pn.user, LearningSource::Other)
+            .await
+    };
+    if let Err(error) = result {
+        warn!("call: failed to persist/migrate caller LID-PN mapping: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -4181,6 +4265,88 @@ mod tests {
         assert!(
             count.load(Ordering::SeqCst) >= 1,
             "handler must invoke the outbound send path for offer ack receipts"
+        );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn offer_receipt_is_sent_before_waiting_for_identity_learning() {
+        let (client, started, release) = make_blocking_sending_client().await;
+        let guard = client.lid_pn_cache.lock_mutation().await;
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("call")
+                .attr("from", fake_caller_lid())
+                .attr("id", "OFFER-IDENTITY-ACK-ORDER")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("offer")
+                    .attr("call-id", "CALL-IDENTITY-ACK-ORDER")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("caller_pn", Jid::pn("15550000001"))
+                    .build()])
+                .build(),
+        );
+        let handling_client = client.clone();
+        let handling = tokio::spawn(async move {
+            let mut cancelled = false;
+            CallHandler
+                .handle(handling_client, node, &mut cancelled)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.recv())
+            .await
+            .expect("offer receipt send must start before identity learning waits")
+            .expect("blocking transport stays connected");
+        assert!(
+            client
+                .call_registry()
+                .take_ringing("CALL-IDENTITY-ACK-ORDER")
+        );
+        release.send(()).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !handling.is_finished(),
+            "after the receipt send, identity learning may wait for the mutation lock"
+        );
+
+        drop(guard);
+        assert!(handling.await.unwrap());
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn terminated_offer_is_not_dispatched_after_identity_learning_waits() {
+        let client = make_client().await;
+        let (handler, events) = ChannelEventHandler::new();
+        let _subscription = client.subscribe_handler(handler);
+        let guard = client.lid_pn_cache.lock_mutation().await;
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("call")
+                .attr("from", fake_caller_lid())
+                .attr("id", "OFFER-IDENTITY-TERMINATE-RACE")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("offer")
+                    .attr("call-id", "CALL-IDENTITY-TERMINATE-RACE")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("caller_pn", Jid::pn("15550000001"))
+                    .build()])
+                .build(),
+        );
+        let mut cancelled = false;
+        let mut handling = Box::pin(CallHandler.handle(client.clone(), node, &mut cancelled));
+        assert!(futures::poll!(handling.as_mut()).is_pending());
+        assert!(
+            client
+                .call_registry()
+                .take_ringing("CALL-IDENTITY-TERMINATE-RACE"),
+            "a racing terminate must see the offer as ringing before identity learning waits"
+        );
+
+        drop(guard);
+        assert!(handling.await);
+        assert!(
+            events.try_recv().is_err(),
+            "an offer terminated while identity learning waited must not be dispatched"
         );
     }
 
